@@ -21,7 +21,7 @@ type Worker struct {
     XrayBin    string
 }
 
-func (w *Worker) Run() []map[string]interface{} {
+func (w *Worker) Run() (working, spares []map[string]interface{}) {
     subURLs, err := readSubURLs(w.SubFile)
     if err != nil {
         log.Fatalf("Ошибка чтения файла подписок: %v", err)
@@ -58,6 +58,7 @@ func (w *Worker) Run() []map[string]interface{} {
 
     batchSize := 150
     var workingOutbounds []map[string]interface{}
+    checkedIndex := 0
 
     for i := 0; i < len(rawOutbounds); i += batchSize {
         if w.MaxProxies > 0 && len(workingOutbounds) >= w.MaxProxies {
@@ -69,6 +70,7 @@ func (w *Worker) Run() []map[string]interface{} {
             end = len(rawOutbounds)
         }
         batch := rawOutbounds[i:end]
+        checkedIndex = end
 
         log.Printf("-> Проверка батча %d - %d из %d...", i+1, end, len(rawOutbounds))
 
@@ -95,7 +97,14 @@ func (w *Worker) Run() []map[string]interface{} {
         log.Printf("   Найдено живых в батче: %d. Всего живых: %d", len(aliveInBatch), len(workingOutbounds))
     }
 
-    return workingOutbounds
+    if w.MaxProxies > 0 && len(workingOutbounds) > w.MaxProxies {
+        workingOutbounds = workingOutbounds[:w.MaxProxies]
+    }
+
+    // Все, что не проверено или осталось после лимита, уходит в запас
+    spares = rawOutbounds[checkedIndex:]
+
+    return workingOutbounds, spares
 }
 
 func readSubURLs(filename string) ([]string, error) {
