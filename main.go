@@ -6,12 +6,13 @@ import (
     "log"
     "net/http"
     "os"
+    "os/exec"
     "os/signal"
     "strings"
     "sync"
     "syscall"
     "time"
-    "os/exec"
+
     "github.com/joho/godotenv"
 )
 
@@ -118,38 +119,47 @@ func startMaintenanceLoop(interval, startPort int, user, pass, bin string, maxPr
         
         status := checkProxiesStatus(activeProxies, startPort, user, pass)
         
-        var newActive []map[string]interface{}
-        deadCount := 0
-        replacedCount := 0
-
-        for i, p := range activeProxies {
-            if status[i] {
-                newActive = append(newActive, p)
-            } else {
-                deadCount++
-                if len(spareProxies) > 0 {
-                    newActive = append(newActive, spareProxies[0])
-                    spareProxies = spareProxies[1:]
-                    replacedCount++
-                }
+        var deadIndices []int
+        for i, isAlive := range status {
+            if !isAlive {
+                deadIndices = append(deadIndices, i)
             }
         }
 
-        if deadCount > 0 {
-            log.Printf("Обнаружено %d мертвых прокси. Заменено %d из запасов.", deadCount, replacedCount)
-            activeProxies = newActive
+        if len(deadIndices) > 0 {
+            log.Printf("Обнаружено %d мертвых прокси. Ищу живые замены в запасах...", len(deadIndices))
+            
+            // Ищем живые прокси среди запасов
+            liveSpares, remainingSpares := verifySpareProxies(spareProxies, len(deadIndices), user, pass, bin)
+            spareProxies = remainingSpares
 
-            if xrayCmd != nil && xrayCmd.Process != nil {
-                xrayCmd.Process.Kill()
-                xrayCmd.Wait()
+            replacedCount := 0
+            for _, idx := range deadIndices {
+                if len(liveSpares) > 0 {
+                    // Заменяем мертвый прокси на живой из запасов на ТОТ ЖЕ САМЫЙ порт
+                    activeProxies[idx] = liveSpares[0]
+                    liveSpares = liveSpares[1:]
+                    replacedCount++
+                }
             }
 
-            finalConfig := buildXrayConfig(activeProxies, startPort, user, pass)
-            saveConfig(finalConfig, "final_config.json")
-            xrayCmd = startXrayFinal("final_config.json", bin)
-            time.Sleep(2 * time.Second)
+            if replacedCount > 0 {
+                log.Printf("Успешно заменено %d прокси. Перезапуск Xray...", replacedCount)
+                
+                if xrayCmd != nil && xrayCmd.Process != nil {
+                    xrayCmd.Process.Kill()
+                    xrayCmd.Wait()
+                }
 
-            printProxies(activeProxies, serverIP, startPort, user, pass)
+                finalConfig := buildXrayConfig(activeProxies, startPort, user, pass)
+                saveConfig(finalConfig, "final_config.json")
+                xrayCmd = startXrayFinal("final_config.json", bin)
+                time.Sleep(2 * time.Second)
+
+                printProxies(activeProxies, serverIP, startPort, user, pass)
+            } else {
+                log.Println("Живых прокси в запасах не найдено для замены.")
+            }
         } else {
             log.Println("Все активные прокси живы.")
         }
