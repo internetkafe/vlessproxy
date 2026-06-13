@@ -64,7 +64,6 @@ func checkProxiesParallel(outbounds []map[string]interface{}, startPort int, use
     return workingOutbounds
 }
 
-// Новая функция для перепроверки: возвращает map[индекс]жив_ли
 func checkProxiesStatus(outbounds []map[string]interface{}, startPort int, user, pass string) map[int]bool {
     type result struct {
         index   int
@@ -84,4 +83,41 @@ func checkProxiesStatus(outbounds []map[string]interface{}, startPort int, user,
         status[res.index] = res.isAlive
     }
     return status
+}
+
+// НОВАЯ ФУНКЦИЯ: Проверка запасных прокси перед заменой
+func verifySpareProxies(proxies []map[string]interface{}, countNeeded int, socksUser, socksPass, xrayBin string) (live []map[string]interface{}, remaining []map[string]interface{}) {
+    if len(proxies) == 0 || countNeeded == 0 {
+        return nil, proxies
+    }
+
+    // Берем с запасом, т.к. многие могут быть мертвы
+    limit := countNeeded * 3
+    if limit > len(proxies) {
+        limit = len(proxies)
+    }
+
+    batch := proxies[:limit]
+    // Оставшиеся запасы возвращаем обратно
+    remaining = proxies[limit:]
+
+    // Используем временные порты 60000+, чтобы не конфликтовать с рабочими 10001+
+    tempStartPort := 60000
+
+    evalConfig := buildXrayConfig(batch, tempStartPort, socksUser, socksPass)
+    evalFile := "spare_eval_config.json"
+    saveConfig(evalConfig, evalFile)
+
+    evalCmd := startXrayBackground(evalFile, xrayBin)
+    time.Sleep(3 * time.Second)
+
+    // Проверяем, кто из запасов живой
+    live = checkProxiesParallel(batch, tempStartPort, socksUser, socksPass, countNeeded)
+
+    if evalCmd != nil && evalCmd.Process != nil {
+        evalCmd.Process.Kill()
+        evalCmd.Wait()
+    }
+
+    return live, remaining
 }
