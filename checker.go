@@ -3,6 +3,7 @@ package main
 import (
     "context"
     "fmt"
+    "log"
     "net"
     "net/http"
     "time"
@@ -85,39 +86,51 @@ func checkProxiesStatus(outbounds []map[string]interface{}, startPort int, user,
     return status
 }
 
-// НОВАЯ ФУНКЦИЯ: Проверка запасных прокси перед заменой
+// ИСПРАВЛЕНО: Теперь функция циклично проходит по всем запасам батчами, пока не найдет нужное количество
 func verifySpareProxies(proxies []map[string]interface{}, countNeeded int, socksUser, socksPass, xrayBin string) (live []map[string]interface{}, remaining []map[string]interface{}) {
     if len(proxies) == 0 || countNeeded == 0 {
         return nil, proxies
     }
 
-    // Берем с запасом, т.к. многие могут быть мертвы
-    limit := countNeeded * 3
-    if limit > len(proxies) {
-        limit = len(proxies)
+    var liveFound []map[string]interface{}
+    batchSize := 150
+    currentIndex := 0
+
+    // Гоняем по запасам батчами, пока не наберем нужное число живых или пока запасы не кончатся
+    for currentIndex < len(proxies) && len(liveFound) < countNeeded {
+        neededNow := countNeeded - len(liveFound)
+
+        end := currentIndex + batchSize
+        if end > len(proxies) {
+            end = len(proxies)
+        }
+        batch := proxies[currentIndex:end]
+
+        log.Printf("-> Проверка запасов батч %d - %d из %d (нужно еще найти: %d)...", currentIndex+1, end, len(proxies), neededNow)
+
+        tempStartPort := 60000
+        evalConfig := buildXrayConfig(batch, tempStartPort, socksUser, socksPass)
+        evalFile := "spare_eval_config.json"
+        saveConfig(evalConfig, evalFile)
+
+        evalCmd := startXrayBackground(evalFile, xrayBin)
+        time.Sleep(3 * time.Second)
+
+        liveInBatch := checkProxiesParallel(batch, tempStartPort, socksUser, socksPass, neededNow)
+
+        if evalCmd != nil && evalCmd.Process != nil {
+            evalCmd.Process.Kill()
+            evalCmd.Wait()
+        }
+
+        if len(liveInBatch) > 0 {
+            log.Printf("   Найдено живых в запасах: %d", len(liveInBatch))
+            liveFound = append(liveFound, liveInBatch...)
+        }
+
+        currentIndex = end
     }
 
-    batch := proxies[:limit]
-    // Оставшиеся запасы возвращаем обратно
-    remaining = proxies[limit:]
-
-    // Используем временные порты 60000+, чтобы не конфликтовать с рабочими 10001+
-    tempStartPort := 60000
-
-    evalConfig := buildXrayConfig(batch, tempStartPort, socksUser, socksPass)
-    evalFile := "spare_eval_config.json"
-    saveConfig(evalConfig, evalFile)
-
-    evalCmd := startXrayBackground(evalFile, xrayBin)
-    time.Sleep(3 * time.Second)
-
-    // Проверяем, кто из запасов живой
-    live = checkProxiesParallel(batch, tempStartPort, socksUser, socksPass, countNeeded)
-
-    if evalCmd != nil && evalCmd.Process != nil {
-        evalCmd.Process.Kill()
-        evalCmd.Wait()
-    }
-
-    return live, remaining
+    // Возвращаем живых и неразобранный остаток списка
+    return liveFound, proxies[currentIndex:]
 }
