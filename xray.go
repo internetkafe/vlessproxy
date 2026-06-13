@@ -4,8 +4,8 @@ import (
     "encoding/json"
     "io"
     "os"
-    "fmt"
     "os/exec"
+    "fmt"
 )
 
 type XrayConfig struct {
@@ -51,8 +51,10 @@ func buildXrayConfig(outbounds []map[string]interface{}, startPort int, user, pa
         })
     }
     return &XrayConfig{
-        Log: &LogConfig{LogLevel: "none"}, Inbounds: inbounds, 
-        Outbounds: allOutbounds, Routing: &RoutingConfig{Rules: rules},
+        Log:       &LogConfig{LogLevel: "none"},
+        Inbounds:  inbounds,
+        Outbounds: allOutbounds,
+        Routing:   &RoutingConfig{Rules: rules},
     }
 }
 
