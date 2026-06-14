@@ -23,6 +23,8 @@ type VMessLink struct {
     Path string `json:"path"`
     Tls  string `json:"tls"`
     Sni  string `json:"sni"`
+    Alpn string `json:"alpn"`
+    Fp   string `json:"fp"`
 }
 
 func getParam(params url.Values, key, fallback string) string {
@@ -30,6 +32,53 @@ func getParam(params url.Values, key, fallback string) string {
         return val[0]
     }
     return fallback
+}
+
+func getBoolParam(params url.Values, key string, fallback bool) bool {
+    val := getParam(params, key, "")
+    if val == "1" || strings.ToLower(val) == "true" {
+        return true
+    }
+    if val == "0" || strings.ToLower(val) == "false" {
+        return false
+    }
+    return fallback
+}
+
+func getAlpnParam(params url.Values, key string) []string {
+    val := getParam(params, key, "")
+    if val == "" {
+        return nil
+    }
+    return strings.Split(val, ",")
+}
+
+func decodeBase64(s string) ([]byte, error) {
+    s = strings.ReplaceAll(s, "\n", "")
+    s = strings.ReplaceAll(s, "\r", "")
+    s = strings.ReplaceAll(s, " ", "")
+    s = strings.TrimSpace(s)
+
+    if len(s)%4 != 0 {
+        s += strings.Repeat("=", 4-len(s)%4)
+    }
+
+    decoded, err := base64.StdEncoding.DecodeString(s)
+    if err == nil {
+        return decoded, nil
+    }
+
+    decoded, err = base64.URLEncoding.DecodeString(s)
+    if err == nil {
+        return decoded, nil
+    }
+
+    decoded, err = base64.RawStdEncoding.DecodeString(strings.TrimRight(s, "="))
+    if err == nil {
+        return decoded, nil
+    }
+
+    return nil, fmt.Errorf("base64 decode failed")
 }
 
 func parseVLESS(uri string) (map[string]interface{}, error) {
@@ -45,30 +94,84 @@ func parseVLESS(uri string) (map[string]interface{}, error) {
     var portInt uint16
     fmt.Sscanf(portStr, "%d", &portInt)
 
+    netType := getParam(params, "type", "tcp")
+    secType := getParam(params, "security", "none")
+    // Поддержка PQC (mlkem768 и т.д.), по умолчанию none
+    encryption := getParam(params, "encryption", "none")
+
     outbound := map[string]interface{}{
         "protocol": "vless",
-        "settings": map[string]interface{}{"vnext": []map[string]interface{}{{"address": address, "port": portInt, "users": []map[string]interface{}{{"id": uuid, "encryption": "none"}}}}},
-        "streamSettings": map[string]interface{}{"network": getParam(params, "type", "tcp"), "security": getParam(params, "security", "none")},
+        "settings": map[string]interface{}{
+            "vnext": []map[string]interface{}{{
+                "address": address, "port": portInt,
+                "users": []map[string]interface{}{{"id": uuid, "encryption": encryption}},
+            }},
+        },
+        "streamSettings": map[string]interface{}{
+            "network":  netType,
+            "security": secType,
+        },
     }
 
-    netType := getParam(params, "type", "tcp")
-    if netType == "ws" {
+    ss := outbound["streamSettings"].(map[string]interface{})
+
+    switch netType {
+    case "ws":
         ws := map[string]interface{}{"path": getParam(params, "path", "/")}
-        if h := getParam(params, "host", ""); h != "" {
-            ws["host"] = h
+        if host := getParam(params, "host", ""); host != "" {
+            ws["host"] = host
         }
-        outbound["streamSettings"].(map[string]interface{})["wsSettings"] = ws
+        ss["wsSettings"] = ws
+    case "grpc":
+        grpc := map[string]interface{}{}
+        if sn := getParam(params, "serviceName", ""); sn != "" {
+            grpc["serviceName"] = sn
+        }
+        if auth := getParam(params, "authority", ""); auth != "" {
+            grpc["authority"] = auth
+        }
+        if mode := getParam(params, "mode", ""); mode == "multi" {
+            grpc["multiMode"] = true
+        }
+        ss["grpcSettings"] = grpc
+    case "xhttp", "splithttp":
+        xhttp := map[string]interface{}{"path": getParam(params, "path", "/")}
+        if host := getParam(params, "host", ""); host != "" {
+            xhttp["host"] = host
+        }
+        if mode := getParam(params, "mode", ""); mode != "" {
+            xhttp["mode"] = mode
+        }
+        ss["xhttpSettings"] = xhttp
     }
-    secType := getParam(params, "security", "none")
+
     if secType == "tls" {
-        outbound["streamSettings"].(map[string]interface{})["tlsSettings"] = map[string]interface{}{"serverName": getParam(params, "sni", ""), "allowInsecure": false}
+        tls := map[string]interface{}{
+            "serverName":    getParam(params, "sni", ""),
+            "allowInsecure": getBoolParam(params, "allowInsecure", false),
+        }
+        if alpn := getAlpnParam(params, "alpn"); alpn != nil {
+            tls["alpn"] = alpn
+        }
+        if fp := getParam(params, "fp", ""); fp != "" {
+            tls["fingerprint"] = fp
+        }
+        ss["tlsSettings"] = tls
     } else if secType == "reality" {
         pbk := getParam(params, "pbk", "")
         if pbk == "" {
-            return nil, fmt.Errorf("no pbk")
+            return nil, fmt.Errorf("no pbk for reality")
         }
-        outbound["streamSettings"].(map[string]interface{})["realitySettings"] = map[string]interface{}{"serverName": getParam(params, "sni", ""), "fingerprint": getParam(params, "fp", "chrome"), "publicKey": pbk, "shortId": getParam(params, "sid", ""), "spiderX": ""}
+        reality := map[string]interface{}{
+            "serverName":  getParam(params, "sni", ""),
+            "fingerprint": getParam(params, "fp", "chrome"),
+            "publicKey":   pbk,
+            "shortId":     getParam(params, "sid", ""),
+            "spiderX":     "",
+        }
+        ss["realitySettings"] = reality
     }
+
     return outbound, nil
 }
 
@@ -77,10 +180,8 @@ func parseVMess(uri string) (map[string]interface{}, error) {
         return nil, fmt.Errorf("not vmess")
     }
     b64 := strings.TrimPrefix(uri, "vmess://")
-    if len(b64)%4 != 0 {
-        b64 += strings.Repeat("=", 4-len(b64)%4)
-    }
-    decoded, err := base64.StdEncoding.DecodeString(b64)
+    
+    decoded, err := decodeBase64(b64)
     if err != nil {
         return nil, err
     }
@@ -97,19 +198,55 @@ func parseVMess(uri string) (map[string]interface{}, error) {
 
     outbound := map[string]interface{}{
         "protocol": "vmess",
-        "settings": map[string]interface{}{"vnext": []map[string]interface{}{{"address": v.Add, "port": portInt, "users": []map[string]interface{}{{"id": v.Id, "alterId": aid, "security": v.Scy}}}}},
-        "streamSettings": map[string]interface{}{"network": v.Net, "security": v.Tls},
+        "settings": map[string]interface{}{
+            "vnext": []map[string]interface{}{{
+                "address": v.Add, "port": portInt,
+                "users": []map[string]interface{}{{"id": v.Id, "alterId": aid, "security": v.Scy}},
+            }},
+        },
+        "streamSettings": map[string]interface{}{
+            "network":  v.Net,
+            "security": v.Tls,
+        },
     }
-    if v.Net == "ws" {
+
+    ss := outbound["streamSettings"].(map[string]interface{})
+
+    switch v.Net {
+    case "ws":
         ws := map[string]interface{}{"path": v.Path}
         if v.Host != "" {
             ws["host"] = v.Host
         }
-        outbound["streamSettings"].(map[string]interface{})["wsSettings"] = ws
+        ss["wsSettings"] = ws
+    case "grpc":
+        grpc := map[string]interface{}{"serviceName": v.Path}
+        if v.Host != "" {
+            grpc["authority"] = v.Host
+        }
+        ss["grpcSettings"] = grpc
+    case "xhttp", "splithttp":
+        xhttp := map[string]interface{}{"path": v.Path}
+        if v.Host != "" {
+            xhttp["host"] = v.Host
+        }
+        ss["xhttpSettings"] = xhttp
     }
+
     if v.Tls == "tls" {
-        outbound["streamSettings"].(map[string]interface{})["tlsSettings"] = map[string]interface{}{"serverName": v.Sni, "allowInsecure": false}
+        tls := map[string]interface{}{
+            "serverName":    v.Sni,
+            "allowInsecure": false,
+        }
+        if v.Alpn != "" {
+            tls["alpn"] = strings.Split(v.Alpn, ",")
+        }
+        if v.Fp != "" {
+            tls["fingerprint"] = v.Fp
+        }
+        ss["tlsSettings"] = tls
     }
+
     return outbound, nil
 }
 
@@ -117,35 +254,83 @@ func parseShadowsocks(uri string) (map[string]interface{}, error) {
     if !strings.HasPrefix(uri, "ss://") {
         return nil, fmt.Errorf("not ss")
     }
-    b64WithRest := strings.TrimPrefix(uri, "ss://")
-    parts := strings.SplitN(b64WithRest, "@", 2)
-    if len(parts) != 2 {
-        return nil, fmt.Errorf("invalid ss format")
+    
+    uriWithoutScheme := strings.TrimPrefix(uri, "ss://")
+    parts := strings.SplitN(uriWithoutScheme, "#", 2)
+    mainPart := parts[0]
+
+    var method, password, host, portStr string
+
+    if strings.Contains(mainPart, "@") {
+        sip002Parts := strings.SplitN(mainPart, "@", 2)
+        if len(sip002Parts) != 2 {
+            return nil, fmt.Errorf("invalid ss sip002 format")
+        }
+        
+        decoded, err := decodeBase64(sip002Parts[0])
+        if err != nil {
+            return nil, fmt.Errorf("invalid ss sip002 base64: %v", err)
+        }
+        credParts := strings.SplitN(string(decoded), ":", 2)
+        if len(credParts) != 2 {
+            return nil, fmt.Errorf("invalid ss sip002 credentials")
+        }
+        method = credParts[0]
+        password = credParts[1]
+        hostPortStr := sip002Parts[1]
+        
+        host, portStr, err = net.SplitHostPort(hostPortStr)
+        if err != nil {
+            return nil, fmt.Errorf("invalid ss sip002 host:port: %v", err)
+        }
+    } else {
+        decoded, err := decodeBase64(mainPart)
+        if err != nil {
+            return nil, fmt.Errorf("invalid ss legacy base64: %v", err)
+        }
+        decodedStr := string(decoded)
+        
+        atIdx := strings.LastIndex(decodedStr, "@")
+        if atIdx == -1 {
+            return nil, fmt.Errorf("invalid ss legacy format: no @")
+        }
+        
+        credPart := decodedStr[:atIdx]
+        hostPortStr := decodedStr[atIdx+1:]
+        
+        credParts := strings.SplitN(credPart, ":", 2)
+        if len(credParts) != 2 {
+            return nil, fmt.Errorf("invalid ss legacy credentials")
+        }
+        method = credParts[0]
+        password = credParts[1]
+        
+        host, portStr, err = net.SplitHostPort(hostPortStr)
+        if err != nil {
+            return nil, fmt.Errorf("invalid ss legacy host:port: %v", err)
+        }
     }
-    if len(parts[0])%4 != 0 {
-        parts[0] += strings.Repeat("=", 4-len(parts[0])%4)
-    }
-    decoded, err := base64.StdEncoding.DecodeString(parts[0])
-    if err != nil {
-        return nil, err
-    }
-    methodPass := strings.SplitN(string(decoded), ":", 2)
-    if len(methodPass) != 2 {
-        return nil, fmt.Errorf("invalid ss credentials")
-    }
-    hostPort := strings.SplitN(parts[1], "#", 2)[0]
-    host, portStr, err := net.SplitHostPort(hostPort)
-    if err != nil {
-        return nil, err
-    }
+
     var portInt uint16
-    fmt.Sscanf(portStr, "%d", &portInt)
+    _, err := fmt.Sscanf(portStr, "%d", &portInt)
+    if err != nil || portInt == 0 {
+        return nil, fmt.Errorf("invalid ss port: %s", portStr)
+    }
+
     return map[string]interface{}{
         "protocol": "shadowsocks",
-        "settings": map[string]interface{}{"servers": []map[string]interface{}{{"address": host, "port": portInt, "method": methodPass[0], "password": methodPass[1]}}},
+        "settings": map[string]interface{}{
+            "servers": []map[string]interface{}{{
+                "address":  host,
+                "port":     portInt,
+                "method":   method,
+                "password": password,
+            }},
+        },
     }, nil
 }
 
+// ПОЛНОСТЬЮ ОБНОВЛЕННЫЙ TROJAN: Поддержка Reality, gRPC, XHTTP и PQC
 func parseTrojan(uri string) (map[string]interface{}, error) {
     parsed, err := url.Parse(uri)
     if err != nil {
@@ -157,9 +342,91 @@ func parseTrojan(uri string) (map[string]interface{}, error) {
     params := parsed.Query()
     var portInt uint16
     fmt.Sscanf(portStr, "%d", &portInt)
-    return map[string]interface{}{
+
+    netType := getParam(params, "type", "tcp")
+    secType := getParam(params, "security", "tls")
+    encryption := getParam(params, "encryption", "")
+
+    outbound := map[string]interface{}{
         "protocol": "trojan",
-        "settings": map[string]interface{}{"servers": []map[string]interface{}{{"address": address, "port": portInt, "password": password}}},
-        "streamSettings": map[string]interface{}{"network": getParam(params, "type", "tcp"), "security": "tls", "tlsSettings": map[string]interface{}{"serverName": getParam(params, "sni", address), "allowInsecure": false}},
-    }, nil
+        "settings": map[string]interface{}{
+            "servers": []map[string]interface{}{{"address": address, "port": portInt, "password": password}},
+        },
+        "streamSettings": map[string]interface{}{
+            "network":  netType,
+            "security": secType,
+        },
+    }
+
+    ss := outbound["streamSettings"].(map[string]interface{})
+
+    switch netType {
+    case "ws":
+        ws := map[string]interface{}{"path": getParam(params, "path", "/")}
+        if host := getParam(params, "host", ""); host != "" {
+            ws["host"] = host
+        }
+        ss["wsSettings"] = ws
+    case "grpc":
+        grpc := map[string]interface{}{}
+        if sn := getParam(params, "serviceName", ""); sn != "" {
+            grpc["serviceName"] = sn
+        }
+        if auth := getParam(params, "authority", ""); auth != "" {
+            grpc["authority"] = auth
+        }
+        if mode := getParam(params, "mode", ""); mode == "multi" {
+            grpc["multiMode"] = true
+        }
+        ss["grpcSettings"] = grpc
+    case "xhttp", "splithttp":
+        xhttp := map[string]interface{}{"path": getParam(params, "path", "/")}
+        if host := getParam(params, "host", ""); host != "" {
+            xhttp["host"] = host
+        }
+        if mode := getParam(params, "mode", ""); mode != "" {
+            xhttp["mode"] = mode
+        }
+        ss["xhttpSettings"] = xhttp
+    }
+
+    if secType == "tls" {
+        tls := map[string]interface{}{
+            "serverName":    getParam(params, "sni", address),
+            "allowInsecure": getBoolParam(params, "allowInsecure", false),
+        }
+        if getBoolParam(params, "insecure", false) {
+            tls["allowInsecure"] = true
+        }
+        if alpn := getAlpnParam(params, "alpn"); alpn != nil {
+            tls["alpn"] = alpn
+        }
+        if fp := getParam(params, "fp", ""); fp != "" {
+            tls["fingerprint"] = fp
+        }
+        
+        if encryption != "" {
+            tls["encryption"] = encryption
+        }
+        ss["tlsSettings"] = tls
+    } else if secType == "reality" {
+        pbk := getParam(params, "pbk", "")
+        if pbk == "" {
+            return nil, fmt.Errorf("no pbk for reality")
+        }
+        reality := map[string]interface{}{
+            "serverName":  getParam(params, "sni", ""),
+            "fingerprint": getParam(params, "fp", "chrome"),
+            "publicKey":   pbk,
+            "shortId":     getParam(params, "sid", ""),
+            "spiderX":     "",
+        }
+        
+        if encryption != "" {
+            reality["encryption"] = encryption
+        }
+        ss["realitySettings"] = reality
+    }
+
+    return outbound, nil
 }
