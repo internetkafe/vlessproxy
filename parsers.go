@@ -1,4 +1,4 @@
-package main
+ package main
 
 import (
     "encoding/base64"
@@ -26,6 +26,7 @@ type VMessLink struct {
     Alpn string `json:"alpn"`
     Fp   string `json:"fp"`
 }
+
 
 func getParam(params url.Values, key, fallback string) string {
     if val, ok := params[key]; ok && len(val) > 0 && val[0] != "" {
@@ -96,7 +97,6 @@ func parseVLESS(uri string) (map[string]interface{}, error) {
 
     netType := getParam(params, "type", "tcp")
     secType := getParam(params, "security", "none")
-    // Поддержка PQC (mlkem768 и т.д.), по умолчанию none
     encryption := getParam(params, "encryption", "none")
 
     outbound := map[string]interface{}{
@@ -180,7 +180,7 @@ func parseVMess(uri string) (map[string]interface{}, error) {
         return nil, fmt.Errorf("not vmess")
     }
     b64 := strings.TrimPrefix(uri, "vmess://")
-    
+
     decoded, err := decodeBase64(b64)
     if err != nil {
         return nil, err
@@ -254,20 +254,22 @@ func parseShadowsocks(uri string) (map[string]interface{}, error) {
     if !strings.HasPrefix(uri, "ss://") {
         return nil, fmt.Errorf("not ss")
     }
-    
+
     uriWithoutScheme := strings.TrimPrefix(uri, "ss://")
     parts := strings.SplitN(uriWithoutScheme, "#", 2)
     mainPart := parts[0]
 
     var method, password, host, portStr string
+    var decoded []byte
+    var err error 
 
     if strings.Contains(mainPart, "@") {
         sip002Parts := strings.SplitN(mainPart, "@", 2)
         if len(sip002Parts) != 2 {
             return nil, fmt.Errorf("invalid ss sip002 format")
         }
-        
-        decoded, err := decodeBase64(sip002Parts[0])
+
+        decoded, err = decodeBase64(sip002Parts[0]) // <--- Используем =
         if err != nil {
             return nil, fmt.Errorf("invalid ss sip002 base64: %v", err)
         }
@@ -278,33 +280,33 @@ func parseShadowsocks(uri string) (map[string]interface{}, error) {
         method = credParts[0]
         password = credParts[1]
         hostPortStr := sip002Parts[1]
-        
+
         host, portStr, err = net.SplitHostPort(hostPortStr)
         if err != nil {
             return nil, fmt.Errorf("invalid ss sip002 host:port: %v", err)
         }
     } else {
-        decoded, err := decodeBase64(mainPart)
+        decoded, err = decodeBase64(mainPart) // <--- Используем =
         if err != nil {
             return nil, fmt.Errorf("invalid ss legacy base64: %v", err)
         }
         decodedStr := string(decoded)
-        
+
         atIdx := strings.LastIndex(decodedStr, "@")
         if atIdx == -1 {
             return nil, fmt.Errorf("invalid ss legacy format: no @")
         }
-        
+
         credPart := decodedStr[:atIdx]
         hostPortStr := decodedStr[atIdx+1:]
-        
+
         credParts := strings.SplitN(credPart, ":", 2)
         if len(credParts) != 2 {
             return nil, fmt.Errorf("invalid ss legacy credentials")
         }
         method = credParts[0]
         password = credParts[1]
-        
+
         host, portStr, err = net.SplitHostPort(hostPortStr)
         if err != nil {
             return nil, fmt.Errorf("invalid ss legacy host:port: %v", err)
@@ -312,7 +314,7 @@ func parseShadowsocks(uri string) (map[string]interface{}, error) {
     }
 
     var portInt uint16
-    _, err := fmt.Sscanf(portStr, "%d", &portInt)
+    _, err = fmt.Sscanf(portStr, "%d", &portInt) // <--- Теперь err видна
     if err != nil || portInt == 0 {
         return nil, fmt.Errorf("invalid ss port: %s", portStr)
     }
@@ -330,7 +332,6 @@ func parseShadowsocks(uri string) (map[string]interface{}, error) {
     }, nil
 }
 
-// ПОЛНОСТЬЮ ОБНОВЛЕННЫЙ TROJAN: Поддержка Reality, gRPC, XHTTP и PQC
 func parseTrojan(uri string) (map[string]interface{}, error) {
     parsed, err := url.Parse(uri)
     if err != nil {
@@ -404,7 +405,7 @@ func parseTrojan(uri string) (map[string]interface{}, error) {
         if fp := getParam(params, "fp", ""); fp != "" {
             tls["fingerprint"] = fp
         }
-        
+
         if encryption != "" {
             tls["encryption"] = encryption
         }
@@ -421,7 +422,7 @@ func parseTrojan(uri string) (map[string]interface{}, error) {
             "shortId":     getParam(params, "sid", ""),
             "spiderX":     "",
         }
-        
+
         if encryption != "" {
             reality["encryption"] = encryption
         }
@@ -429,4 +430,91 @@ func parseTrojan(uri string) (map[string]interface{}, error) {
     }
 
     return outbound, nil
+}
+
+
+func parseHy2(uri string) (map[string]interface{}, error) {
+    parsed, err := url.Parse(uri)
+    if err != nil {
+        return nil, err
+    }
+    password := parsed.User.String()
+    if strings.Contains(password, ":") {
+        password = strings.Split(password, ":")[0]
+    }
+    address := parsed.Hostname()
+    portStr := parsed.Port()
+    params := parsed.Query()
+
+    var portInt uint16
+    fmt.Sscanf(portStr, "%d", &portInt)
+
+    serverConfig := map[string]interface{}{
+        "address":  address,
+        "port":     portInt,
+        "password": password,
+    }
+
+    if sni := getParam(params, "sni", ""); sni != "" {
+        serverConfig["sni"] = sni
+    }
+    if insecure := getBoolParam(params, "insecure", false); insecure {
+        serverConfig["allowInsecure"] = true // В Xray используется allowInsecure
+    }
+    if obfs := getParam(params, "obfs", ""); obfs != "" {
+        serverConfig["obfs"] = obfs
+        serverConfig["obfsPassword"] = getParam(params, "obfs-password", "")
+    }
+
+    return map[string]interface{}{
+        "protocol": "hysteria2",
+        "settings": map[string]interface{}{
+            "servers": []map[string]interface{}{serverConfig}, // По стандарту Xray
+        },
+    }, nil
+}
+
+func parseTuic(uri string) (map[string]interface{}, error) {
+    parsed, err := url.Parse(uri)
+    if err != nil {
+        return nil, err
+    }
+    uuid := parsed.User.Username()
+    password, _ := parsed.User.Password()
+    address := parsed.Hostname()
+    portStr := parsed.Port()
+    params := parsed.Query()
+
+    var portInt uint16
+    fmt.Sscanf(portStr, "%d", &portInt)
+
+    serverConfig := map[string]interface{}{
+        "address":  address,
+        "port":     portInt,
+        "uuid":     uuid,
+        "password": password,
+    }
+
+    if sni := getParam(params, "sni", ""); sni != "" {
+        serverConfig["sni"] = sni
+    }
+    if alpn := getAlpnParam(params, "alpn"); alpn != nil {
+        serverConfig["alpn"] = alpn
+    }
+    if cc := getParam(params, "congestion_control", ""); cc != "" {
+        serverConfig["congestionControlType"] = cc
+    }
+    if uc := getParam(params, "udp_relay_mode", ""); uc != "" {
+        serverConfig["udpRelayMode"] = uc
+    }
+    if insecure := getBoolParam(params, "allow_insecure", false); insecure {
+        serverConfig["allowInsecure"] = true
+    }
+
+    return map[string]interface{}{
+        "protocol": "tuic",
+        "settings": map[string]interface{}{
+            "servers": []map[string]interface{}{serverConfig}, // По стандарту Xray
+        },
+    }, nil
 }
